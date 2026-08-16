@@ -16,7 +16,7 @@
 | `requirements_qwen_colab.txt` | نسخة صريحة من اعتماديات Colab نفسها. |
 | `peft-mora/` | فرع PEFT المحلي الذي يضيف `use_mora=True` و`mora_type`. لم يُعدّل كود MoRA في هذه الحزمة. |
 | `train_legacy_deepspeed.py` | نسخة احتياطية من نقطة الدخول القديمة الخاصة بـ LLaMA/DeepSpeed، ولا تُستخدم في المسار الجديد. |
-| `colab_train_qwen25_3b_mora.ipynb` | دفتر Colab ينفذ الاستنساخ، التثبيت، تنزيل Drive، الفحص، smoke test، التدريب، والاستئناف. |
+| `colab_train_qwen25_3b_mora.ipynb` | دفتر Colab ينفذ الاستنساخ، التثبيت، تنزيل البيانات، الفحص، smoke test، التدريب، والاستئناف، مع حفظ محلي احتياطي عند تعذر Drive. |
 | `.gitignore` | يمنع رفع الأسرار وملفات البيانات الكبيرة وcheckpoints إلى GitHub. |
 
 ملف البيانات المضغوط هو النسخة التي جازت التدقيق السابق: **165,303 سجل**، وبحد أقصى مُدقّق يبلغ **1024 token** للسجل. السجلات تحتوي على الحقل `messages` بأدوار `system` و`user` و`assistant`، إلى جانب حقول المصدر والتصنيف والمرجع التي لا يحتاجها المدرب بعد مرحلة التحقق.
@@ -25,7 +25,7 @@
 
 الفرع المخصص للمشروع هو `moranew` داخل المستودع العام `EngKHALIDx/qwen25-3b-yemeni-mora`. افتح ملف `colab_train_qwen25_3b_mora.ipynb` في Colab، ثم اختر GPU وشغّل الخلايا بالترتيب. لا تحتاج النسخة العامة الحالية إلى `GITHUB_TOKEN`. إذا أُعيدت خصوصية المستودع مستقبلاً، يمكن إضافة Secret باسم `GITHUB_TOKEN` يملك صلاحية القراءة، أو رفع مجلد المشروع يدوياً إلى `/content/qwen25-3b-yemeni-mora`. لا تضع أي مفتاح داخل الدفتر ولا ترفعه إلى GitHub.
 
-الدفتر ينزّل البيانات من معرّف Drive المضمن في الخلية، ويتحقق من SHA-256 وعدد السجلات قبل التدريب. لا تُرفع نسخة البيانات الكبيرة إلى GitHub؛ تُجلب وقت التشغيل من Drive وتحفظ النتائج في Google Drive.
+الدفتر ينزّل البيانات من معرّف Drive المضمن في الخلية، ويتحقق من SHA-256 وعدد السجلات قبل التدريب. لا تُرفع نسخة البيانات الكبيرة إلى GitHub؛ تُجلب وقت التشغيل من Drive. يحاول الدفتر حفظ النتائج في Google Drive، لكن عند فشل `drive.mount` يستخدم `/content/qwen25_3b_mora_adapter` محلياً ولا يوقف التدريب؛ بعده يمكن ضغط الـadapter وتنزيله من خلية التصدير الأخيرة.
 
 ## التشغيل السريع في Google Colab
 
@@ -47,10 +47,13 @@
   --output_dir ./smoke_test_adapter
 ```
 
-إذا اكتمل الاختبار دون أخطاء، شغّل كامل مجموعة البيانات بالإعدادات المعتمدة:
+إذا اكتمل الاختبار دون أخطاء، شغّل كامل مجموعة البيانات بالإعدادات المعتمدة. يفضل تشغيله من خلية الدفتر لأن مسار النتائج فيها يختار Drive إن توفر أو `/content` تلقائياً:
 
 ```python
-!python train.py --config configs/qwen25_3b_mora.json
+!python train.py \\
+  --config configs/qwen25_3b_mora.json \\
+  --data_path /content/qwen25_data/qwen25_3b_semantic_colab.jsonl \\
+  --output_dir /content/qwen25_3b_mora_adapter
 ```
 
 يمكن تمرير أي قيمة من سطر الأوامر لتجاوز قيمة ملف JSON. مثال ذلك استخدام نسبة تحقق صغيرة مع الإبقاء على بقية الإعدادات:
@@ -99,7 +102,7 @@ pip install -e ./peft-mora
 
 ## استئناف التدريب والحفظ
 
-بعد التدريب يحفظ `Trainer` adapter وtokenizer وملفات الحالة داخل `output_dir`. لاستئناف آخر checkpoint:
+بعد التدريب يحفظ `Trainer` adapter وtokenizer وملفات الحالة داخل `output_dir`. إذا كان Drive مربوطاً فاختر مساراً داخل `MyDrive`، وإلا استخدم `/content/qwen25_3b_mora_adapter` واضغط المجلد من خلية التصدير الأخيرة قبل انتهاء جلسة Colab. لاستئناف آخر checkpoint:
 
 ```python
 !python train.py \
