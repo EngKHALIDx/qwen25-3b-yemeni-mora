@@ -1,0 +1,12 @@
+# Google Colab free / T4-V100 environment for Qwen2.5-3B + local MoRA PEFT.
+# Colab already provides a CUDA-enabled torch build; do not force-install torch here.
+transformers>=4.45.0,<4.50.0
+accelerate>=0.34.0,<1.0
+datasets>=2.20.0,<4.0
+bitsandbytes>=0.43.1
+safetensors>=0.4.3
+huggingface_hub>=0.24.0
+sentencepiece>=0.2.0
+tqdm>=4.66.0
+# Install the repository's unchanged MoRA-enabled PEFT fork.
+-e ./peft-mora

@@ -1,0 +1,27 @@
+# Secrets and local credentials
+.env
+.env.*
+*.token
+*credentials*.json
+
+# Colab and notebook runtime artifacts
+.ipynb_checkpoints/
+__pycache__/
+*.py[cod]
+
+# Training outputs and downloaded data
+qwen25_3b_mora_adapter/
+qwen25_mora_smoke_test/
+checkpoint-*/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+qwen25_3b_semantic_colab.jsonl
+qwen25_3b_semantic_colab.jsonl.gz
+
+# Logs and temporary files
+*.log
+wandb/
+runs/
