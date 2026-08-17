@@ -32,6 +32,11 @@ class QuantLinear(torch.nn.Module, LoraLayer):
         init_lora_weights: bool = True,
         use_rslora: bool = False,
         use_dora: bool = False,
+        use_mora: bool = False,
+        mora_type: int = 1,
+        use_gl_log_mora: bool = False,
+        gl_log_lambda: float = 0.01,
+        gl_log_delta: float = 1e-3,
         **kwargs,
     ):
         super().__init__()
@@ -52,6 +57,11 @@ class QuantLinear(torch.nn.Module, LoraLayer):
             init_lora_weights=init_lora_weights,
             use_rslora=use_rslora,
             use_dora=use_dora,
+            use_mora=use_mora,
+            mora_type=mora_type,
+            use_gl_log_mora=use_gl_log_mora,
+            gl_log_lambda=gl_log_lambda,
+            gl_log_delta=gl_log_delta,
         )
 
     def forward(self, x: torch.Tensor):
@@ -74,7 +84,10 @@ class QuantLinear(torch.nn.Module, LoraLayer):
                 expected_dtype = result.dtype
                 x = x.to(lora_A.weight.dtype)
 
-            output = lora_B(lora_A(dropout(x)))
+            if self.use_mora.get(active_adapter, False):
+                output = self._apply_mora(dropout(x), lora_A, lora_B, scaling, active_adapter)
+            else:
+                output = lora_B(lora_A(dropout(x)))
             if requires_conversion:
                 output = output.to(expected_dtype)
             output = output * scaling

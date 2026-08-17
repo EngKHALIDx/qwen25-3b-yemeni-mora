@@ -257,8 +257,26 @@ class LoraConfig(PeftConfig):
         default=1,
         metadata={
             "help": (
-                "Enable MoRA"
+                "MoRA structural mapping type"
             )
+        },
+    )
+    use_gl_log_mora: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable GL-log-MoRA: apply a trainable Q after the MoRA bottleneck and regularize Q.",
+        },
+    )
+    gl_log_lambda: float = field(
+        default=0.01,
+        metadata={
+            "help": "Coefficient lambda for -lambda * logdet(Q^T Q + delta I).",
+        },
+    )
+    gl_log_delta: float = field(
+        default=1e-3,
+        metadata={
+            "help": "Positive numerical stabilizer delta for logdet(Q^T Q + delta I).",
         },
     )
 
@@ -277,6 +295,12 @@ class LoraConfig(PeftConfig):
 
         if self.use_dora and (self.megatron_config or self.init_lora_weights == "loftq"):
             raise ValueError("DoRA does not support megatron_core or LoftQ. Please set `use_dora=False`.")
+        if self.use_gl_log_mora and not self.use_mora:
+            raise ValueError("use_gl_log_mora=True requires use_mora=True")
+        if self.gl_log_lambda < 0:
+            raise ValueError("gl_log_lambda must be non-negative")
+        if self.gl_log_delta <= 0:
+            raise ValueError("gl_log_delta must be positive")
 
         # handle init_lora_weights and loftq_config
         if self.init_lora_weights == "loftq":

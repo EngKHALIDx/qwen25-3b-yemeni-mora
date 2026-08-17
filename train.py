@@ -130,6 +130,30 @@ def parse_args() -> argparse.Namespace:
         choices=[1, 2, 3, 4, 6],
         help="MoRA implementation variant. Type 6 is the RoPE-based small-rank option.",
     )
+    parser.add_argument(
+        "--use_gl_log_mora",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable the GL-log-MoRA Q transform and log-determinant regularizer.",
+    )
+    parser.add_argument(
+        "--gl_log_lambda",
+        type=float,
+        default=0.01,
+        help="Lambda in -lambda*logdet(Q^T Q + delta I).",
+    )
+    parser.add_argument(
+        "--gl_log_delta",
+        type=float,
+        default=1e-3,
+        help="Positive numerical stabilizer delta for the GL-log-MoRA regularizer.",
+    )
+    parser.add_argument(
+        "--gl_log_q_lr",
+        type=float,
+        default=3e-4,
+        help="Separate learning rate for GL-log-MoRA Q parameters.",
+    )
 
     # Colab memory and numerical settings.
     parser.add_argument(
@@ -478,6 +502,82 @@ def build_training_args(
     return TrainingArguments(**values)
 
 
+class GLLogMoRATrainer(Trainer):
+    """Trainer that adds the GL-log-MoRA regularizer and separates Q learning rate."""
+
+    def __init__(self, *args: Any, gl_log_q_lr: float = 3e-4, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.gl_log_q_lr = float(gl_log_q_lr)
+
+    def _gl_log_mora_regularization(self, model: Any) -> torch.Tensor | None:
+        terms: List[torch.Tensor] = []
+        for module in model.modules():
+            regularizer = getattr(module, "gl_log_mora_regularizer", None)
+            if not callable(regularizer):
+                continue
+            active_adapters = getattr(module, "active_adapters", [])
+            if callable(active_adapters):
+                active_adapters = active_adapters()
+            flags = getattr(module, "use_gl_log_mora", {})
+            for adapter_name in active_adapters:
+                if isinstance(flags, dict) and flags.get(adapter_name, False):
+                    terms.append(regularizer(adapter_name).float())
+        if not terms:
+            return None
+        return torch.stack(terms).mean()
+
+    def compute_loss(
+        self,
+        model: Any,
+        inputs: Dict[str, Any],
+        return_outputs: bool = False,
+        num_items_in_batch: int | None = None,
+    ):
+        outputs = model(**inputs)
+        if hasattr(outputs, "loss"):
+            task_loss = outputs.loss
+        elif isinstance(outputs, dict):
+            task_loss = outputs["loss"]
+        else:
+            task_loss = outputs[0]
+        regularizer = self._gl_log_mora_regularization(model)
+        loss = task_loss + regularizer.to(task_loss.dtype) if regularizer is not None else task_loss
+        return (loss, outputs) if return_outputs else loss
+
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return
+        q_parameters = []
+        base_parameters = []
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if "lora_Q" in name:
+                q_parameters.append(parameter)
+            else:
+                base_parameters.append((name, parameter))
+
+        if not q_parameters or self.gl_log_q_lr <= 0:
+            return super().create_optimizer()
+
+        decay_parameters = []
+        no_decay_parameters = []
+        for name, parameter in base_parameters:
+            if name.endswith("bias") or "norm" in name.lower():
+                no_decay_parameters.append(parameter)
+            else:
+                decay_parameters.append(parameter)
+
+        optimizer_grouped_parameters = [
+            {"params": decay_parameters, "weight_decay": self.args.weight_decay, "lr": self.args.learning_rate},
+            {"params": no_decay_parameters, "weight_decay": 0.0, "lr": self.args.learning_rate},
+            {"params": q_parameters, "weight_decay": 0.0, "lr": self.gl_log_q_lr},
+        ]
+        optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
+        self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+        LOGGER.info("GL-log-MoRA Q optimizer group: %d parameters, lr=%s", len(q_parameters), self.gl_log_q_lr)
+
+
 def main() -> None:
     configure_logging()
     args = parse_args()
@@ -532,6 +632,9 @@ def main() -> None:
         task_type="CAUSAL_LM",
         use_mora=args.use_mora,
         mora_type=args.mora_type,
+        use_gl_log_mora=args.use_gl_log_mora,
+        gl_log_lambda=args.gl_log_lambda,
+        gl_log_delta=args.gl_log_delta,
     )
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
@@ -547,13 +650,14 @@ def main() -> None:
 
     data_collator = ChatDataCollator(tokenizer=tokenizer, model=model)
     training_args = build_training_args(args, use_bf16=use_bf16, has_eval=eval_dataset is not None)
-    trainer = Trainer(
+    trainer = GLLogMoRATrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         tokenizer=tokenizer,
         data_collator=data_collator,
+        gl_log_q_lr=args.gl_log_q_lr,
     )
 
     LOGGER.info("Starting training: %d records", len(train_dataset))
@@ -571,6 +675,10 @@ def main() -> None:
         "use_4bit": args.use_4bit,
         "use_mora": args.use_mora,
         "mora_type": args.mora_type,
+        "use_gl_log_mora": args.use_gl_log_mora,
+        "gl_log_lambda": args.gl_log_lambda,
+        "gl_log_delta": args.gl_log_delta,
+        "gl_log_q_lr": args.gl_log_q_lr,
         "rank": args.r,
         "target_modules": args.target_modules,
         "assistant_only_loss": True,

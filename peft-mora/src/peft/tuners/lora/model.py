@@ -158,6 +158,9 @@ class LoraModel(BaseTuner):
             "use_dora": lora_config.use_dora,
             "use_mora": lora_config.use_mora,
             "mora_type": lora_config.mora_type,
+            "use_gl_log_mora": lora_config.use_gl_log_mora,
+            "gl_log_lambda": lora_config.gl_log_lambda,
+            "gl_log_delta": lora_config.gl_log_delta,
             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
         }
@@ -185,6 +188,9 @@ class LoraModel(BaseTuner):
                 use_dora=lora_config.use_dora,
                 use_mora=use_mora,
                 mora_type=lora_config.mora_type,
+                use_gl_log_mora=lora_config.use_gl_log_mora,
+                gl_log_lambda=lora_config.gl_log_lambda,
+                gl_log_delta=lora_config.gl_log_delta,
             )
         else:
             new_module = self._create_new_module(lora_config, adapter_name, target, **kwargs)

@@ -41,6 +41,9 @@ if is_bnb_available():
             use_dora: bool = False,
             use_mora: bool = False,
             mora_type: int = 1,
+            use_gl_log_mora: bool = False,
+            gl_log_lambda: float = 0.01,
+            gl_log_delta: float = 1e-3,
             **kwargs,
         ) -> None:
             super().__init__()
@@ -60,6 +63,9 @@ if is_bnb_available():
                 use_dora=use_dora,
                 use_mora=use_mora,
                 mora_type=mora_type,
+                use_gl_log_mora=use_gl_log_mora,
+                gl_log_lambda=gl_log_lambda,
+                gl_log_delta=gl_log_delta,
             )
 
         def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
@@ -152,6 +158,11 @@ if is_bnb_available():
                 state.reset_grads()
 
         def get_delta_weight(self, adapter):
+            if self.use_mora.get(adapter, False):
+                # Reuse the tested structured reconstruction from the dense Linear layer;
+                # this also includes Q @ M for GL-log-MoRA.
+                from .layer import Linear
+                return Linear.get_delta_weight(self, adapter)
             return (
                 transpose(
                     self.lora_B[adapter].weight @ self.lora_A[adapter].weight,
@@ -183,7 +194,10 @@ if is_bnb_available():
                         compute_dtype = lora_A.weight.dtype
                         if x.dtype != compute_dtype:
                             x = x.to(compute_dtype)
-                    output = lora_B(lora_A(dropout(x)))
+                    if self.use_mora.get(active_adapter, False):
+                        output = self._apply_mora(dropout(x), lora_A, lora_B, scaling, active_adapter)
+                    else:
+                        output = lora_B(lora_A(dropout(x)))
                     if requires_conversion:
                         output = output.to(expected_dtype)
                     output = output * scaling
@@ -235,6 +249,9 @@ if is_bnb_4bit_available():
             use_dora: bool = False,
             use_mora: bool = False,
             mora_type: int = 1,
+            use_gl_log_mora: bool = False,
+            gl_log_lambda: float = 0.01,
+            gl_log_delta: float = 1e-3,
             **kwargs,
         ) -> None:
             super().__init__()
@@ -254,6 +271,9 @@ if is_bnb_4bit_available():
                 use_dora=use_dora,
                 use_mora=use_mora,
                 mora_type=mora_type,
+                use_gl_log_mora=use_gl_log_mora,
+                gl_log_lambda=gl_log_lambda,
+                gl_log_delta=gl_log_delta,
             )
 
         def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
@@ -323,6 +343,11 @@ if is_bnb_4bit_available():
                 )
 
         def get_delta_weight(self, adapter):
+            if self.use_mora.get(adapter, False):
+                # Reuse the tested structured reconstruction from the dense Linear layer;
+                # this also includes Q @ M for GL-log-MoRA.
+                from .layer import Linear
+                return Linear.get_delta_weight(self, adapter)
             return (
                 transpose(
                     self.lora_B[adapter].weight @ self.lora_A[adapter].weight,

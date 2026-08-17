@@ -36,6 +36,11 @@ class AwqLoraLinear(torch.nn.Module, LoraLayer):
         lora_dropout: float = 0.0,
         init_lora_weights: bool = True,
         use_rslora: bool = False,
+        use_mora: bool = False,
+        mora_type: int = 1,
+        use_gl_log_mora: bool = False,
+        gl_log_lambda: float = 0.01,
+        gl_log_delta: float = 1e-3,
         **kwargs,
     ):
         super().__init__()
@@ -46,7 +51,11 @@ class AwqLoraLinear(torch.nn.Module, LoraLayer):
         self.quant_linear_module = base_layer
 
         self._active_adapter = adapter_name
-        self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora)
+        self.update_layer(
+            adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora,
+            use_mora=use_mora, mora_type=mora_type, use_gl_log_mora=use_gl_log_mora,
+            gl_log_lambda=gl_log_lambda, gl_log_delta=gl_log_delta,
+        )
 
     def forward(self, x: torch.Tensor):
         result = self.quant_linear_module(x)
@@ -67,7 +76,10 @@ class AwqLoraLinear(torch.nn.Module, LoraLayer):
                 expected_dtype = result.dtype
                 x = x.to(lora_A.weight.dtype)
 
-            output = lora_B(lora_A(dropout(x)))
+            if self.use_mora.get(active_adapter, False):
+                output = self._apply_mora(dropout(x), lora_A, lora_B, scaling, active_adapter)
+            else:
+                output = lora_B(lora_A(dropout(x)))
             if requires_conversion:
                 output = output.to(expected_dtype)
             output = output * scaling

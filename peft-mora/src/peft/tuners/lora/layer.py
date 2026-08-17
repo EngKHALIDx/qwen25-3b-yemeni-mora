@@ -30,7 +30,7 @@ from .config import LoraConfig
 
 class LoraLayer(BaseTunerLayer):
     # All names of layers that may contain (trainable) adapter weights
-    adapter_layer_names = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
+    adapter_layer_names = ("lora_A", "lora_B", "lora_Q", "lora_embedding_A", "lora_embedding_B")
     # All names of other parameters that may contain adapter-related parameters
     other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout")
 
@@ -42,6 +42,8 @@ class LoraLayer(BaseTunerLayer):
         self.lora_dropout = nn.ModuleDict({})
         self.lora_A = nn.ModuleDict({})
         self.lora_B = nn.ModuleDict({})
+        # GL-log-MoRA uses a trainable square Q matrix after the MoRA bottleneck.
+        self.lora_Q = nn.ParameterDict({})
         # For Embedding layer
         self.lora_embedding_A = nn.ParameterDict({})
         self.lora_embedding_B = nn.ParameterDict({})
@@ -54,6 +56,9 @@ class LoraLayer(BaseTunerLayer):
         self.kwargs = kwargs
 
         self.use_mora: dict[str, bool] = {}
+        self.use_gl_log_mora: dict[str, bool] = {}
+        self.gl_log_lambda: dict[str, float] = {}
+        self.gl_log_delta: dict[str, float] = {}
 
         self.mora_type: dict[str, int] = {}
 
@@ -89,7 +94,8 @@ class LoraLayer(BaseTunerLayer):
 
     def update_layer(
         self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False,
-        use_mora: bool = False, mora_type: int = 1,
+        use_mora: bool = False, mora_type: int = 1, use_gl_log_mora: bool = False,
+        gl_log_lambda: float = 0.01, gl_log_delta: float = 1e-3,
     ):
         # This code works for linear layers, override for other layer types
         if r <= 0:
@@ -106,6 +112,11 @@ class LoraLayer(BaseTunerLayer):
 
         self.use_mora[adapter_name] = False
         self.mora_type[adapter_name] = mora_type
+        self.use_gl_log_mora[adapter_name] = bool(use_mora and use_gl_log_mora)
+        self.gl_log_lambda[adapter_name] = float(gl_log_lambda)
+        self.gl_log_delta[adapter_name] = float(gl_log_delta)
+        if self.gl_log_delta[adapter_name] <= 0:
+            raise ValueError("gl_log_delta must be positive for a stable log-determinant regularizer")
 
         if use_mora:
             new_r = int(math.sqrt((self.in_features + self.out_features)*r)+0.5)
@@ -118,6 +129,8 @@ class LoraLayer(BaseTunerLayer):
 
             nn.init.zeros_(self.lora_A[adapter_name].weight)
             self.lora_B[adapter_name] = self.lora_A[adapter_name]
+            if self.use_gl_log_mora[adapter_name]:
+                self.lora_Q[adapter_name] = nn.Parameter(torch.eye(new_r))
             self.use_mora[adapter_name] = True
             self.scaling[adapter_name] = 1.0
         else:
@@ -134,16 +147,17 @@ class LoraLayer(BaseTunerLayer):
             elif init_lora_weights:
                 self.reset_lora_parameters(adapter_name, init_lora_weights)
 
-            # check weight and qweight (for GPTQ)
-            for weight_name in ("weight", "qweight"):
-                weight = getattr(self.get_base_layer(), weight_name, None)
-                if weight is not None:
-                    # the layer is already completely initialized, this is an update
-                    if weight.dtype.is_floating_point or weight.dtype.is_complex:
-                        self.to(weight.device, dtype=weight.dtype)
-                    else:
-                        self.to(weight.device)
-                    break
+
+        # Keep adapter parameters, including Q, on the same device and dtype as the base layer.
+        # This is especially important for direct layer construction and mixed-precision training.
+        for weight_name in ("weight", "qweight"):
+            weight = getattr(self.get_base_layer(), weight_name, None)
+            if weight is not None:
+                if weight.dtype.is_floating_point or weight.dtype.is_complex:
+                    self.to(weight.device, dtype=weight.dtype)
+                else:
+                    self.to(weight.device)
+                break
 
         if use_dora:
             self.dora_init(adapter_name)
@@ -160,6 +174,8 @@ class LoraLayer(BaseTunerLayer):
         if self.use_mora[adapter_name]:
             nn.init.zeros_(self.lora_A[adapter_name].weight)
             self.lora_B[adapter_name] = self.lora_A[adapter_name]
+            if self.use_gl_log_mora.get(adapter_name, False):
+                nn.init.eye_(self.lora_Q[adapter_name])
             if mora_type is not None:
                 self.mora_type[adapter_name] = mora_type
             return
@@ -273,6 +289,10 @@ class LoraLayer(BaseTunerLayer):
 
 
         out_x = lora_A(in_x)
+        if self.use_gl_log_mora.get(active_adapter, False):
+            # The paper defines the bottleneck update as Q M z. Since lora_A stores M,
+            # applying Q as a Linear map here gives exactly Q(M z).
+            out_x = F.linear(out_x, self.lora_Q[active_adapter])
 
         if mora_type == 1 or mora_type == 3:
             repeat_time = out_f // r
@@ -298,6 +318,19 @@ class LoraLayer(BaseTunerLayer):
                 out_x = torch.cat([out_x]*repeat_time, dim=-1)[..., :out_f]
 
         return out_x
+
+    def gl_log_mora_regularizer(self, adapter_name: str) -> torch.Tensor:
+        """Return -lambda log det(Q^T Q + delta I) for one GL-log-MoRA adapter."""
+        if not self.use_gl_log_mora.get(adapter_name, False):
+            weight = self.get_base_layer().weight
+            return weight.new_zeros(())
+        q = self.lora_Q[adapter_name]
+        q32 = q.float()
+        dim = q32.shape[-1]
+        identity = torch.eye(dim, device=q32.device, dtype=q32.dtype)
+        matrix = q32.transpose(0, 1).matmul(q32) + self.gl_log_delta[adapter_name] * identity
+        _, log_abs_det = torch.linalg.slogdet(matrix)
+        return -self.gl_log_lambda[adapter_name] * log_abs_det.to(dtype=q.dtype)
 
     def _apply_dora(self, x, lora_A, lora_B, scaling, active_adapter):
         """
@@ -385,6 +418,9 @@ class Linear(nn.Module, LoraLayer):
         use_dora: bool = False,
         use_mora: bool = False,
         mora_type: int = 1,
+        use_gl_log_mora: bool = False,
+        gl_log_lambda: float = 0.01,
+        gl_log_delta: float = 1e-3,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -402,6 +438,9 @@ class Linear(nn.Module, LoraLayer):
             use_dora=use_dora,
             use_mora=use_mora,
             mora_type=mora_type,
+            use_gl_log_mora=use_gl_log_mora,
+            gl_log_lambda=gl_log_lambda,
+            gl_log_delta=gl_log_delta,
         )
         self.is_target_conv_1d_layer = is_target_conv_1d_layer
 
@@ -514,6 +553,9 @@ class Linear(nn.Module, LoraLayer):
         if self.use_mora[adapter]:
             in_f, out_f = self.in_features, self.out_features
             r = self.r[adapter]
+            if self.use_gl_log_mora.get(adapter, False):
+                # get_delta_weight reconstructs the effective full matrix. Replace M by Q M.
+                weight_A = self.lora_Q[adapter].to(device=weight_A.device, dtype=weight_A.dtype).matmul(weight_A)
             if in_f % r != 0:
                 pad_size = r - in_f % r
             else:
