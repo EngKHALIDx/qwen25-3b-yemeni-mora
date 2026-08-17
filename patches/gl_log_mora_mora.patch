@@ -1,0 +1,1045 @@
+diff --git a/GL_LOG_MORA.md b/GL_LOG_MORA.md
+new file mode 100644
+index 0000000..6b270c3
+--- /dev/null
++++ b/GL_LOG_MORA.md
+@@ -0,0 +1,104 @@
++# تطبيق GL-log-MoRA على مستودع MoRA
++
++هذه النسخة المحلية مبنية من مستودع [MoRA الأصلي](https://github.com/kongds/MoRA) وتضيف إليه تطبيق **GL-log-MoRA** كما تصفه الورقة المنشورة في [Information 2026, 17, 460](https://doi.org/10.3390/info17050460).
++
++## الفكرة الرياضية
++
++يستخدم MoRA تحويلًا من الشكل:
++
++> `ΔW x = f_decomp(M f_comp(x))`
++
++أما GL-log-MoRA فيضيف مصفوفة عامة قابلة للتعلم `Q` داخل فضاء الاختناق:
++
++> `ΔW x = f_decomp(Q M f_comp(x))`
++
++حيث إن `M` هي مصفوفة MoRA الأصلية، و`Q ∈ R^(r̂ × r̂)` مصفوفة مربعة مهيأة بالهوية. بقي الضغط `f_comp` وفك الضغط `f_decomp` كما هما في MoRA، ولذلك لا يتغير mapping الخاص بـ `mora_type`.
++
++يضاف إلى خسارة المهمة المنتظم التالي:
++
++> `L_reg = -λ log det(Qᵀ Q + δ I)`
++
++وفي هذه النسخة يُحسب المنتظم لكل طبقة GL-log-MoRA فعّالة ثم يؤخذ متوسطه عبر الطبقات، حتى لا تتغير موازنة `λ` لمجرد زيادة عدد الطبقات المستهدفة. تُستخدم `slogdet` على النسخة `float32` من `Q` لتحسين الاستقرار العددي، ثم تُعاد قيمة المنتظم إلى dtype الخاص بـ `Q`.
++
++## الملفات المعدلة
++
++| الملف | التعديل |
++|---|---|
++| `peft-mora/src/peft/tuners/lora/layer.py` | إضافة `lora_Q`، تطبيق `Q M` داخل `_apply_mora`، وإضافة `gl_log_mora_regularizer`، وتضمين Q في إعادة بناء delta عند الدمج. |
++| `peft-mora/src/peft/tuners/lora/config.py` | إضافة `use_gl_log_mora` و`gl_log_lambda` و`gl_log_delta` مع التحقق من القيم. |
++| `peft-mora/src/peft/tuners/lora/model.py` | تمرير إعدادات GL-log-MoRA إلى الطبقات المحقونة. |
++| `peft-mora/src/peft/tuners/lora/bnb.py` | دعم Q ومسار MoRA في 8-bit و4-bit، بما في ذلك إعادة بناء delta. |
++| `peft-mora/src/peft/tuners/lora/gptq.py` | دعم إعدادات GL-log-MoRA في forward لمسار GPTQ. |
++| `peft-mora/src/peft/tuners/lora/awq.py` | دعم إعدادات GL-log-MoRA في forward لمسار AWQ. |
++| `peft-mora/src/peft/tuners/lora/aqlm.py` | دعم إعدادات GL-log-MoRA في forward لمسار AQLM. |
++| `train.py` | إضافة المنتظم إلى loss، وإنشاء مجموعة optimizer منفصلة لـ Q، وإضافة معاملات CLI. |
++
++## الاستخدام البرمجي
++
++```python
++from peft import LoraConfig, get_peft_model
++
++config = LoraConfig(
++    r=8,
++    lora_alpha=16,
++    lora_dropout=0.05,
++    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
++    task_type="CAUSAL_LM",
++    use_mora=True,
++    mora_type=6,
++    use_gl_log_mora=True,
++    gl_log_lambda=0.01,
++    gl_log_delta=1e-3,
++)
++
++model = get_peft_model(model, config)
++# التدريب المعتاد عبر Trainer أو حلقة PyTorch.
++```
++
++عند استخدام `get_peft_model` تُدرّب كل من `lora_A`/`M` و`lora_Q`، بينما تبقى معاملات النموذج الأساسي مجمّدة وفق سلوك PEFT المعتاد. تبدأ `Q` من مصفوفة الهوية، ويبدأ `M` من تهيئة MoRA الأصلية.
++
++## الاستخدام من train.py
++
++إعدادات الورقة الأساسية هي `2e-4` لمصفوفة `M` و`3e-4` لمصفوفة `Q`، مع `λ=0.01` و`δ=0.001`. يمكن تشغيل المسار كما يلي بعد توفير نموذج وبيانات متوافقة مع المستودع:
++
++```bash
++PYTHONPATH=peft-mora/src python3 train.py \
++  --base_model <MODEL> \
++  --data_path <TOKENIZED_DATASET> \
++  --wandb_run_name gl-log-mora-r8 \
++  --lora_target_modules q_proj,k_proj,v_proj,o_proj \
++  --lora_r 8 \
++  --mora_type 6 \
++  --use_mora \
++  --use_gl_log_mora \
++  --learning_rate 2e-4 \
++  --gl_log_q_lr 3e-4 \
++  --gl_log_lambda 0.01 \
++  --gl_log_delta 1e-3
++```
++
++إذا كانت قيمة `gl_log_q_lr` سالبة، يستخدم المدرب تلقائيًا `1.5 × learning_rate`. ولإعادة إعدادات الورقة حرفيًا يُفضّل تمرير القيمتين صراحة كما في المثال.
++
++## الحفظ والدمج
++
++بما أن اسم معامل Q يبدأ بـ `lora_Q`، تلتقطه آليات PEFT الحالية التي تحفظ مفاتيح `lora_*`. كما اختُبر تحميل Q من `state_dict`. وعند استخدام طبقة كثيفة أو مسار bnb الذي يدعم الدمج، تُعاد مصفوفة التحديث باستخدام `Q @ M` قبل إضافتها إلى وزن النموذج. أما backends التي لا تدعم الدمج فيبقى التطبيق في forward كما هو متوقع.
++
++## حدود التطبيق
++
++هذا تطبيق هندسي مستنتج مباشرة من معادلات الورقة وليس كود المؤلف الأصلي. لذلك لا يمكن اعتباره إعادة إنتاج رسمية للنتائج التجريبية قبل تشغيل fine-tuning كامل على LLaMA-3.1-8B-Instruct والبيانات نفسها. كما أن عمليات PEFT المتقدمة التي تعيد تركيب adapters متعددة، مثل `add_weighted_adapter` وtask arithmetic، تحتاج سياسة تركيب خاصة لمصفوفات Q؛ لا ينبغي استخدامها لدمج GL-log-MoRA adapters دون اختبار مخصص.
++
++## الاختبارات
++
++تشغيل الاختبارات المحلية:
++
++```bash
++cd /home/ubuntu/mora_gl_log_review/mora
++PYTHONPATH=peft-mora/src:. pytest -q tests
++```
++
++تغطي الاختبارات تهيئة Q، ومطابقة forward مع delta المعاد بناؤه، وmerge/unmerge، وتدرجات Q وM، وحقن `LoraConfig`، وحفظ Q وإعادة تحميله، وإضافة المنتظم إلى مسار `OurTrainer`، وفصل معدل تعلم Q.
++
++## المراجع
++
++[1]: https://github.com/kongds/MoRA "MoRA: المستودع الأصلي"
++[2]: https://doi.org/10.3390/info17050460 "GL-log-MoRA، Information 2026, 17, 460"
+diff --git a/VALIDATION_REPORT.md b/VALIDATION_REPORT.md
+new file mode 100644
+index 0000000..47dd0a1
+--- /dev/null
++++ b/VALIDATION_REPORT.md
+@@ -0,0 +1,124 @@
++# تقرير التحقق من نسخة GL-log-MoRA المحلية
++
++## النتيجة المختصرة
++
++تم نسخ مستودع MoRA محليًا من [المصدر الأصلي][1] في المسار التالي:
++
++```text
++/home/ubuntu/mora_gl_log_review/mora
++```
++
++النسخة مرتبطة بـ remote الآتي:
++
++```text
++https://github.com/kongds/MoRA.git
++```
++
++وكانت نقطة البداية المحلية هي commit `de5df31` على الفرع `main`. أضيف تطبيق GL-log-MoRA إلى النسخة المحلية دون تعديل المستودع البعيد.
++
++> **الحكم:** الاختبارات المحلية الخاصة بالطبقة، والتكامل، والحفظ، والمدرب نجحت بالكامل: `4 passed`.
++
++نجاح الاختبارات يثبت صحة المسار الحسابي والتنفيذي على نموذج صغير، لكنه لا يثبت وحده الوصول إلى نفس أرقام الورقة على نموذج LLaMA-3.1-8B وبياناتها؛ ذلك يتطلب تشغيل fine-tuning كامل على عتاد مناسب.
++
++## ما تم تطبيقه
++
++| المجال | الحالة | دليل التنفيذ |
++|---|---:|---|
++| مصفوفة Q مربعة مهيأة بالهوية | مكتمل | `layer.py`: `lora_Q` وتهيئة `torch.eye` |
++| تطبيق `Q M` داخل bottleneck | مكتمل | `_apply_mora` يطبق `F.linear(out_x, Q)` بعد M |
++| منتظم `-λ logdet(QᵀQ+δI)` | مكتمل | `gl_log_mora_regularizer` مع `slogdet` و`float32` |
++| إدخال المنتظم في loss | مكتمل | `_gl_log_mora_regularization` داخل `OurTrainer.compute_loss` |
++| معدل تعلم مستقل لـQ | مكتمل | مجموعة optimizer منفصلة، افتراضي الورقة `3e-4` |
++| معدل تعلم M الافتراضي | مضبوط | `learning_rate=2e-4` |
++| حفظ Q وإعادة تحميله | مكتمل | مفاتيح `lora_Q` ضمن state dict واختبار إعادة التحميل |
++| merge/unmerge في الطبقة الكثيفة | مكتمل | إعادة بناء delta باستخدام `Q @ M` |
++| bnb 4-bit و8-bit | موصول | forward وdelta reconstruction يدعمان GL-log-MoRA |
++| GPTQ وAWQ وAQLM | موصول في forward | أضيفت معاملات GL والمسار `_apply_mora` |
++| دمج adapters متعددة عبر task arithmetic | غير موصى به | يحتاج سياسة خاصة لتركيب Q ولم يُعلن مدعومًا |
++
++## نتائج الاختبارات
++
++شُغلت الاختبارات بالأمر التالي:
++
++```bash
++cd /home/ubuntu/mora_gl_log_review/mora
++PYTHONPATH=peft-mora/src:. pytest -q tests
++```
++
++والنتيجة:
++
++```text
++....                                                                     [100%]
++4 passed in 15.95s
++```
++
++تفاصيل الاختبارات هي كما يلي.
++
++| الاختبار | ما يثبته |
++|---|---|
++| `test_gl_log_mora.py` | تهيئة Q، الصيغة العددية للمنتظم، تطابق forward مع delta، merge/unmerge، وتدرجات Q وM. |
++| `test_gl_log_integration.py` | وصول إعدادات `LoraConfig` إلى الطبقات، إنشاء طبقتين GL، توليد تدرجات Q، حفظ Q، وإعادة تحميله. |
++| `test_gl_log_trainer.py` | إضافة المنتظم إلى مسار المدرب وإنشاء مجموعة optimizer مستقلة لـQ بمعدل `3e-4`. |
++
++كما تم فحص النحو بنجاح عبر:
++
++```bash
++python3 -m py_compile train.py peft-mora/src/peft/tuners/lora/*.py \
++  tests/test_gl_log_mora.py tests/test_gl_log_integration.py tests/test_gl_log_trainer.py
++```
++
++## الاعتماديات المثبتة
++
++تم تثبيت PyTorch واعتماديات `peft-mora/requirements.txt` في بيئة Python المحلية، ثم أُعيد تشغيل الاختبارات بعد التثبيت. لم يعد خطأ `ModuleNotFoundError: No module named 'torch'` ظاهرًا.
++
++## الفرق عن الورقة
++
++تعرّف الورقة GL-log-MoRA وفق المعادلة:
++
++> `y = W0 x + f_decomp(Q M f_comp(x))`
++
++وتستخدم المنتظم:
++
++> `L_reg = -λ log det(QᵀQ + δI)`
++
++وتذكر إعدادات تجريبية تشمل `λ=0.01` و`δ=0.001` ومعدل تعلم `2e-4` لـM و`3e-4` لـQ.[2] هذه القيم متاحة في `train.py` ويمكن تمريرها صراحة من سطر الأوامر.
++
++يوجد اختلاف هندسي مقصود: الورقة لا تنشر كود المؤلف الأصلي، ولذلك أُضيف المنتظم في `OurTrainer` على شكل متوسط عبر طبقات GL الفعالة. هذا يمنع تغير مقياس المنتظم بسبب عدد طبقات target modules، لكنه يجب تسجيله عند مقارنة النتائج الخارجية.
++
++## تشغيل fine-tuning فعلي
++
++بعد توفير النموذج والبيانات المتوافقة مع المستودع، يمكن تشغيل:
++
++```bash
++cd /home/ubuntu/mora_gl_log_review/mora
++PYTHONPATH=peft-mora/src python3 train.py \
++  --base_model <MODEL> \
++  --data_path <TOKENIZED_DATASET> \
++  --wandb_run_name gl-log-mora-r8 \
++  --lora_target_modules q_proj,k_proj,v_proj,o_proj \
++  --lora_r 8 \
++  --mora_type 6 \
++  --use_mora \
++  --use_gl_log_mora \
++  --learning_rate 2e-4 \
++  --gl_log_q_lr 3e-4 \
++  --gl_log_lambda 0.01 \
++  --gl_log_delta 1e-3
++```
++
++لا يمكن تشغيل هذا الأمر end-to-end في الاختبار المحلي الحالي من دون مسار نموذج وبيانات حقيقيين. أما الاختبارات الحالية فتستخدم نموذجًا صغيرًا حتميًا لتتحقق من المنطق دون تنزيل نموذج 8B أو بيانات ضخمة.
++
++## الملفات المضافة
++
++```text
++GL_LOG_MORA.md                  # وثيقة التشغيل والصيغة الرياضية
++VALIDATION_REPORT.md              # هذا التقرير
++tests/test_gl_log_mora.py         # اختبار الطبقة والدمج والتدرج
++tests/test_gl_log_integration.py  # اختبار الحقن والحفظ وإعادة التحميل
++tests/test_gl_log_trainer.py      # اختبار loss وoptimizer
++```
++
++## المراجع
++
++[1]: https://github.com/kongds/MoRA "MoRA: High-Rank Updating for Parameter-Efficient Fine-Tuning"
++[2]: https://doi.org/10.3390/info17050460 "GL-log-MoRA، Information 2026, 17, 460"
+diff --git a/peft-mora/src/peft/tuners/lora/aqlm.py b/peft-mora/src/peft/tuners/lora/aqlm.py
+index 8c8e90e..8605458 100644
+--- a/peft-mora/src/peft/tuners/lora/aqlm.py
++++ b/peft-mora/src/peft/tuners/lora/aqlm.py
+@@ -35,13 +35,22 @@ class AqlmLoraLinear(torch.nn.Module, LoraLayer):
+         lora_dropout: float = 0.0,
+         init_lora_weights: bool = True,
+         use_rslora: bool = False,
++        use_mora: bool = False,
++        mora_type: int = 1,
++        use_gl_log_mora: bool = False,
++        gl_log_lambda: float = 0.01,
++        gl_log_delta: float = 1e-3,
+         **kwargs,
+     ):
+         super().__init__()
+         LoraLayer.__init__(self, base_layer)
+
+         self._active_adapter = adapter_name
+-        self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora)
++        self.update_layer(
++            adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora,
++            use_mora=use_mora, mora_type=mora_type, use_gl_log_mora=use_gl_log_mora,
++            gl_log_lambda=gl_log_lambda, gl_log_delta=gl_log_delta,
++        )
+
+     def forward(self, x: torch.Tensor):
+         # note: logic differs from default Linear because merging is not supported
+@@ -63,7 +72,10 @@ class AqlmLoraLinear(torch.nn.Module, LoraLayer):
+                 expected_dtype = result.dtype
+                 x = x.to(lora_A.weight.dtype)
+
+-            output = lora_B(lora_A(dropout(x)))
++            if self.use_mora.get(active_adapter, False):
++                output = self._apply_mora(dropout(x), lora_A, lora_B, scaling, active_adapter)
++            else:
++                output = lora_B(lora_A(dropout(x)))
+             if requires_conversion:
+                 output = output.to(expected_dtype)
+             output = output * scaling
+diff --git a/peft-mora/src/peft/tuners/lora/awq.py b/peft-mora/src/peft/tuners/lora/awq.py
+index b3f5bf3..973c8a5 100644
+--- a/peft-mora/src/peft/tuners/lora/awq.py
++++ b/peft-mora/src/peft/tuners/lora/awq.py
+@@ -36,6 +36,11 @@ class AwqLoraLinear(torch.nn.Module, LoraLayer):
+         lora_dropout: float = 0.0,
+         init_lora_weights: bool = True,
+         use_rslora: bool = False,
++        use_mora: bool = False,
++        mora_type: int = 1,
++        use_gl_log_mora: bool = False,
++        gl_log_lambda: float = 0.01,
++        gl_log_delta: float = 1e-3,
+         **kwargs,
+     ):
+         super().__init__()
+@@ -46,7 +51,11 @@ class AwqLoraLinear(torch.nn.Module, LoraLayer):
+         self.quant_linear_module = base_layer
+
+         self._active_adapter = adapter_name
+-        self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora)
++        self.update_layer(
++            adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora,
++            use_mora=use_mora, mora_type=mora_type, use_gl_log_mora=use_gl_log_mora,
++            gl_log_lambda=gl_log_lambda, gl_log_delta=gl_log_delta,
++        )
+
+     def forward(self, x: torch.Tensor):
+         result = self.quant_linear_module(x)
+@@ -67,7 +76,10 @@ class AwqLoraLinear(torch.nn.Module, LoraLayer):
+                 expected_dtype = result.dtype
+                 x = x.to(lora_A.weight.dtype)
+
+-            output = lora_B(lora_A(dropout(x)))
++            if self.use_mora.get(active_adapter, False):
++                output = self._apply_mora(dropout(x), lora_A, lora_B, scaling, active_adapter)
++            else:
++                output = lora_B(lora_A(dropout(x)))
+             if requires_conversion:
+                 output = output.to(expected_dtype)
+             output = output * scaling
+diff --git a/peft-mora/src/peft/tuners/lora/bnb.py b/peft-mora/src/peft/tuners/lora/bnb.py
+index 86b1dda..27e28f6 100644
+--- a/peft-mora/src/peft/tuners/lora/bnb.py
++++ b/peft-mora/src/peft/tuners/lora/bnb.py
+@@ -41,6 +41,9 @@ if is_bnb_available():
+             use_dora: bool = False,
+             use_mora: bool = False,
+             mora_type: int = 1,
++            use_gl_log_mora: bool = False,
++            gl_log_lambda: float = 0.01,
++            gl_log_delta: float = 1e-3,
+             **kwargs,
+         ) -> None:
+             super().__init__()
+@@ -60,6 +63,9 @@ if is_bnb_available():
+                 use_dora=use_dora,
+                 use_mora=use_mora,
+                 mora_type=mora_type,
++                use_gl_log_mora=use_gl_log_mora,
++                gl_log_lambda=gl_log_lambda,
++                gl_log_delta=gl_log_delta,
+             )
+
+         def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
+@@ -152,6 +158,11 @@ if is_bnb_available():
+                 state.reset_grads()
+
+         def get_delta_weight(self, adapter):
++            if self.use_mora.get(adapter, False):
++                # Reuse the tested structured reconstruction from the dense Linear layer;
++                # this also includes Q @ M for GL-log-MoRA.
++                from .layer import Linear
++                return Linear.get_delta_weight(self, adapter)
+             return (
+                 transpose(
+                     self.lora_B[adapter].weight @ self.lora_A[adapter].weight,
+@@ -183,7 +194,10 @@ if is_bnb_available():
+                         compute_dtype = lora_A.weight.dtype
+                         if x.dtype != compute_dtype:
+                             x = x.to(compute_dtype)
+-                    output = lora_B(lora_A(dropout(x)))
++                    if self.use_mora.get(active_adapter, False):
++                        output = self._apply_mora(dropout(x), lora_A, lora_B, scaling, active_adapter)
++                    else:
++                        output = lora_B(lora_A(dropout(x)))
+                     if requires_conversion:
+                         output = output.to(expected_dtype)
+                     output = output * scaling
+@@ -235,6 +249,9 @@ if is_bnb_4bit_available():
+             use_dora: bool = False,
+             use_mora: bool = False,
+             mora_type: int = 1,
++            use_gl_log_mora: bool = False,
++            gl_log_lambda: float = 0.01,
++            gl_log_delta: float = 1e-3,
+             **kwargs,
+         ) -> None:
+             super().__init__()
+@@ -254,6 +271,9 @@ if is_bnb_4bit_available():
+                 use_dora=use_dora,
+                 use_mora=use_mora,
+                 mora_type=mora_type,
++                use_gl_log_mora=use_gl_log_mora,
++                gl_log_lambda=gl_log_lambda,
++                gl_log_delta=gl_log_delta,
+             )
+
+         def merge(self, safe_merge: bool = False, adapter_names: Optional[List[str]] = None) -> None:
+@@ -323,6 +343,11 @@ if is_bnb_4bit_available():
+                 )
+
+         def get_delta_weight(self, adapter):
++            if self.use_mora.get(adapter, False):
++                # Reuse the tested structured reconstruction from the dense Linear layer;
++                # this also includes Q @ M for GL-log-MoRA.
++                from .layer import Linear
++                return Linear.get_delta_weight(self, adapter)
+             return (
+                 transpose(
+                     self.lora_B[adapter].weight @ self.lora_A[adapter].weight,
+diff --git a/peft-mora/src/peft/tuners/lora/config.py b/peft-mora/src/peft/tuners/lora/config.py
+index 869233e..90a6ccb 100644
+--- a/peft-mora/src/peft/tuners/lora/config.py
++++ b/peft-mora/src/peft/tuners/lora/config.py
+@@ -257,10 +257,28 @@ class LoraConfig(PeftConfig):
+         default=1,
+         metadata={
+             "help": (
+-                "Enable MoRA"
++                "MoRA structural mapping type"
+             )
+         },
+     )
++    use_gl_log_mora: bool = field(
++        default=False,
++        metadata={
++            "help": "Enable GL-log-MoRA: apply a trainable Q after the MoRA bottleneck and regularize Q.",
++        },
++    )
++    gl_log_lambda: float = field(
++        default=0.01,
++        metadata={
++            "help": "Coefficient lambda for -lambda * logdet(Q^T Q + delta I).",
++        },
++    )
++    gl_log_delta: float = field(
++        default=1e-3,
++        metadata={
++            "help": "Positive numerical stabilizer delta for logdet(Q^T Q + delta I).",
++        },
++    )
+
+     def __post_init__(self):
+         self.peft_type = PeftType.LORA
+@@ -277,6 +295,12 @@ class LoraConfig(PeftConfig):
+
+         if self.use_dora and (self.megatron_config or self.init_lora_weights == "loftq"):
+             raise ValueError("DoRA does not support megatron_core or LoftQ. Please set `use_dora=False`.")
++        if self.use_gl_log_mora and not self.use_mora:
++            raise ValueError("use_gl_log_mora=True requires use_mora=True")
++        if self.gl_log_lambda < 0:
++            raise ValueError("gl_log_lambda must be non-negative")
++        if self.gl_log_delta <= 0:
++            raise ValueError("gl_log_delta must be positive")
+
+         # handle init_lora_weights and loftq_config
+         if self.init_lora_weights == "loftq":
+diff --git a/peft-mora/src/peft/tuners/lora/gptq.py b/peft-mora/src/peft/tuners/lora/gptq.py
+index 333dfa6..edfdb44 100644
+--- a/peft-mora/src/peft/tuners/lora/gptq.py
++++ b/peft-mora/src/peft/tuners/lora/gptq.py
+@@ -32,6 +32,11 @@ class QuantLinear(torch.nn.Module, LoraLayer):
+         init_lora_weights: bool = True,
+         use_rslora: bool = False,
+         use_dora: bool = False,
++        use_mora: bool = False,
++        mora_type: int = 1,
++        use_gl_log_mora: bool = False,
++        gl_log_lambda: float = 0.01,
++        gl_log_delta: float = 1e-3,
+         **kwargs,
+     ):
+         super().__init__()
+@@ -52,6 +57,11 @@ class QuantLinear(torch.nn.Module, LoraLayer):
+             init_lora_weights=init_lora_weights,
+             use_rslora=use_rslora,
+             use_dora=use_dora,
++            use_mora=use_mora,
++            mora_type=mora_type,
++            use_gl_log_mora=use_gl_log_mora,
++            gl_log_lambda=gl_log_lambda,
++            gl_log_delta=gl_log_delta,
+         )
+
+     def forward(self, x: torch.Tensor):
+@@ -74,7 +84,10 @@ class QuantLinear(torch.nn.Module, LoraLayer):
+                 expected_dtype = result.dtype
+                 x = x.to(lora_A.weight.dtype)
+
+-            output = lora_B(lora_A(dropout(x)))
++            if self.use_mora.get(active_adapter, False):
++                output = self._apply_mora(dropout(x), lora_A, lora_B, scaling, active_adapter)
++            else:
++                output = lora_B(lora_A(dropout(x)))
+             if requires_conversion:
+                 output = output.to(expected_dtype)
+             output = output * scaling
+diff --git a/peft-mora/src/peft/tuners/lora/layer.py b/peft-mora/src/peft/tuners/lora/layer.py
+index 0f318e7..57e1345 100644
+--- a/peft-mora/src/peft/tuners/lora/layer.py
++++ b/peft-mora/src/peft/tuners/lora/layer.py
+@@ -30,7 +30,7 @@ from .config import LoraConfig
+
+ class LoraLayer(BaseTunerLayer):
+     # All names of layers that may contain (trainable) adapter weights
+-    adapter_layer_names = ("lora_A", "lora_B", "lora_embedding_A", "lora_embedding_B")
++    adapter_layer_names = ("lora_A", "lora_B", "lora_Q", "lora_embedding_A", "lora_embedding_B")
+     # All names of other parameters that may contain adapter-related parameters
+     other_param_names = ("r", "lora_alpha", "scaling", "lora_dropout")
+
+@@ -42,6 +42,8 @@ class LoraLayer(BaseTunerLayer):
+         self.lora_dropout = nn.ModuleDict({})
+         self.lora_A = nn.ModuleDict({})
+         self.lora_B = nn.ModuleDict({})
++        # GL-log-MoRA uses a trainable square Q matrix after the MoRA bottleneck.
++        self.lora_Q = nn.ParameterDict({})
+         # For Embedding layer
+         self.lora_embedding_A = nn.ParameterDict({})
+         self.lora_embedding_B = nn.ParameterDict({})
+@@ -54,6 +56,9 @@ class LoraLayer(BaseTunerLayer):
+         self.kwargs = kwargs
+
+         self.use_mora: dict[str, bool] = {}
++        self.use_gl_log_mora: dict[str, bool] = {}
++        self.gl_log_lambda: dict[str, float] = {}
++        self.gl_log_delta: dict[str, float] = {}
+
+         self.mora_type: dict[str, int] = {}
+
+@@ -89,7 +94,8 @@ class LoraLayer(BaseTunerLayer):
+
+     def update_layer(
+         self, adapter_name, r, lora_alpha, lora_dropout, init_lora_weights, use_rslora, use_dora: bool = False,
+-        use_mora: bool = False, mora_type: int = 1,
++        use_mora: bool = False, mora_type: int = 1, use_gl_log_mora: bool = False,
++        gl_log_lambda: float = 0.01, gl_log_delta: float = 1e-3,
+     ):
+         # This code works for linear layers, override for other layer types
+         if r <= 0:
+@@ -106,6 +112,11 @@ class LoraLayer(BaseTunerLayer):
+
+         self.use_mora[adapter_name] = False
+         self.mora_type[adapter_name] = mora_type
++        self.use_gl_log_mora[adapter_name] = bool(use_mora and use_gl_log_mora)
++        self.gl_log_lambda[adapter_name] = float(gl_log_lambda)
++        self.gl_log_delta[adapter_name] = float(gl_log_delta)
++        if self.gl_log_delta[adapter_name] <= 0:
++            raise ValueError("gl_log_delta must be positive for a stable log-determinant regularizer")
+
+         if use_mora:
+             new_r = int(math.sqrt((self.in_features + self.out_features)*r)+0.5)
+@@ -118,6 +129,8 @@ class LoraLayer(BaseTunerLayer):
+
+             nn.init.zeros_(self.lora_A[adapter_name].weight)
+             self.lora_B[adapter_name] = self.lora_A[adapter_name]
++            if self.use_gl_log_mora[adapter_name]:
++                self.lora_Q[adapter_name] = nn.Parameter(torch.eye(new_r))
+             self.use_mora[adapter_name] = True
+             self.scaling[adapter_name] = 1.0
+         else:
+@@ -134,16 +147,17 @@ class LoraLayer(BaseTunerLayer):
+             elif init_lora_weights:
+                 self.reset_lora_parameters(adapter_name, init_lora_weights)
+
+-            # check weight and qweight (for GPTQ)
+-            for weight_name in ("weight", "qweight"):
+-                weight = getattr(self.get_base_layer(), weight_name, None)
+-                if weight is not None:
+-                    # the layer is already completely initialized, this is an update
+-                    if weight.dtype.is_floating_point or weight.dtype.is_complex:
+-                        self.to(weight.device, dtype=weight.dtype)
+-                    else:
+-                        self.to(weight.device)
+-                    break
++
++        # Keep adapter parameters, including Q, on the same device and dtype as the base layer.
++        # This is especially important for direct layer construction and mixed-precision training.
++        for weight_name in ("weight", "qweight"):
++            weight = getattr(self.get_base_layer(), weight_name, None)
++            if weight is not None:
++                if weight.dtype.is_floating_point or weight.dtype.is_complex:
++                    self.to(weight.device, dtype=weight.dtype)
++                else:
++                    self.to(weight.device)
++                break
+
+         if use_dora:
+             self.dora_init(adapter_name)
+@@ -160,6 +174,8 @@ class LoraLayer(BaseTunerLayer):
+         if self.use_mora[adapter_name]:
+             nn.init.zeros_(self.lora_A[adapter_name].weight)
+             self.lora_B[adapter_name] = self.lora_A[adapter_name]
++            if self.use_gl_log_mora.get(adapter_name, False):
++                nn.init.eye_(self.lora_Q[adapter_name])
+             if mora_type is not None:
+                 self.mora_type[adapter_name] = mora_type
+             return
+@@ -273,6 +289,10 @@ class LoraLayer(BaseTunerLayer):
+
+
+         out_x = lora_A(in_x)
++        if self.use_gl_log_mora.get(active_adapter, False):
++            # The paper defines the bottleneck update as Q M z. Since lora_A stores M,
++            # applying Q as a Linear map here gives exactly Q(M z).
++            out_x = F.linear(out_x, self.lora_Q[active_adapter])
+
+         if mora_type == 1 or mora_type == 3:
+             repeat_time = out_f // r
+@@ -299,6 +319,19 @@ class LoraLayer(BaseTunerLayer):
+
+         return out_x
+
++    def gl_log_mora_regularizer(self, adapter_name: str) -> torch.Tensor:
++        """Return -lambda log det(Q^T Q + delta I) for one GL-log-MoRA adapter."""
++        if not self.use_gl_log_mora.get(adapter_name, False):
++            weight = self.get_base_layer().weight
++            return weight.new_zeros(())
++        q = self.lora_Q[adapter_name]
++        q32 = q.float()
++        dim = q32.shape[-1]
++        identity = torch.eye(dim, device=q32.device, dtype=q32.dtype)
++        matrix = q32.transpose(0, 1).matmul(q32) + self.gl_log_delta[adapter_name] * identity
++        _, log_abs_det = torch.linalg.slogdet(matrix)
++        return -self.gl_log_lambda[adapter_name] * log_abs_det.to(dtype=q.dtype)
++
+     def _apply_dora(self, x, lora_A, lora_B, scaling, active_adapter):
+         """
+         For DoRA, calculate the extra output from LoRA with DoRA applied. This should be added on top of the base layer
+@@ -385,6 +418,9 @@ class Linear(nn.Module, LoraLayer):
+         use_dora: bool = False,
+         use_mora: bool = False,
+         mora_type: int = 1,
++        use_gl_log_mora: bool = False,
++        gl_log_lambda: float = 0.01,
++        gl_log_delta: float = 1e-3,
+         **kwargs,
+     ) -> None:
+         super().__init__()
+@@ -402,6 +438,9 @@ class Linear(nn.Module, LoraLayer):
+             use_dora=use_dora,
+             use_mora=use_mora,
+             mora_type=mora_type,
++            use_gl_log_mora=use_gl_log_mora,
++            gl_log_lambda=gl_log_lambda,
++            gl_log_delta=gl_log_delta,
+         )
+         self.is_target_conv_1d_layer = is_target_conv_1d_layer
+
+@@ -514,6 +553,9 @@ class Linear(nn.Module, LoraLayer):
+         if self.use_mora[adapter]:
+             in_f, out_f = self.in_features, self.out_features
+             r = self.r[adapter]
++            if self.use_gl_log_mora.get(adapter, False):
++                # get_delta_weight reconstructs the effective full matrix. Replace M by Q M.
++                weight_A = self.lora_Q[adapter].to(device=weight_A.device, dtype=weight_A.dtype).matmul(weight_A)
+             if in_f % r != 0:
+                 pad_size = r - in_f % r
+             else:
+diff --git a/peft-mora/src/peft/tuners/lora/model.py b/peft-mora/src/peft/tuners/lora/model.py
+index 611aeab..217560e 100644
+--- a/peft-mora/src/peft/tuners/lora/model.py
++++ b/peft-mora/src/peft/tuners/lora/model.py
+@@ -158,6 +158,9 @@ class LoraModel(BaseTuner):
+             "use_dora": lora_config.use_dora,
+             "use_mora": lora_config.use_mora,
+             "mora_type": lora_config.mora_type,
++            "use_gl_log_mora": lora_config.use_gl_log_mora,
++            "gl_log_lambda": lora_config.gl_log_lambda,
++            "gl_log_delta": lora_config.gl_log_delta,
+             "loaded_in_8bit": getattr(self.model, "is_loaded_in_8bit", False),
+             "loaded_in_4bit": getattr(self.model, "is_loaded_in_4bit", False),
+         }
+@@ -185,6 +188,9 @@ class LoraModel(BaseTuner):
+                 use_dora=lora_config.use_dora,
+                 use_mora=use_mora,
+                 mora_type=lora_config.mora_type,
++                use_gl_log_mora=lora_config.use_gl_log_mora,
++                gl_log_lambda=lora_config.gl_log_lambda,
++                gl_log_delta=lora_config.gl_log_delta,
+             )
+         else:
+             new_module = self._create_new_module(lora_config, adapter_name, target, **kwargs)
+diff --git a/tests/test_gl_log_integration.py b/tests/test_gl_log_integration.py
+new file mode 100644
+index 0000000..b0f53e8
+--- /dev/null
++++ b/tests/test_gl_log_integration.py
+@@ -0,0 +1,88 @@
++import sys
++from pathlib import Path
++
++import torch
++from transformers import PretrainedConfig, PreTrainedModel
++from transformers.modeling_outputs import CausalLMOutput
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "peft-mora" / "src"))
++
++from peft import LoraConfig, get_peft_model, get_peft_model_state_dict, set_peft_model_state_dict
++
++
++class TinyConfig(PretrainedConfig):
++    model_type = "tiny-gl-log-mora"
++
++    def __init__(self, hidden_size=8, vocab_size=8, **kwargs):
++        super().__init__(**kwargs)
++        self.hidden_size = hidden_size
++        self.vocab_size = vocab_size
++
++
++class TinyCausalLM(PreTrainedModel):
++    config_class = TinyConfig
++    base_model_prefix = "model"
++
++    def __init__(self, config):
++        super().__init__(config)
++        self.q_proj = torch.nn.Linear(config.hidden_size, config.hidden_size)
++        self.v_proj = torch.nn.Linear(config.hidden_size, config.hidden_size)
++        self.lm_head = torch.nn.Linear(config.hidden_size, config.vocab_size)
++
++    def forward(self, input_ids=None, labels=None, **kwargs):
++        hidden = torch.nn.functional.one_hot(input_ids, num_classes=self.config.vocab_size).float()
++        hidden = torch.tanh(self.q_proj(hidden))
++        hidden = torch.tanh(self.v_proj(hidden))
++        logits = self.lm_head(hidden)
++        loss = None
++        if labels is not None:
++            loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
++        return CausalLMOutput(loss=loss, logits=logits)
++
++
++def main():
++    torch.manual_seed(13)
++    model = TinyCausalLM(TinyConfig())
++    config = LoraConfig(
++        r=2,
++        lora_alpha=2,
++        lora_dropout=0.0,
++        target_modules=["q_proj", "v_proj"],
++        use_mora=True,
++        mora_type=1,
++        use_gl_log_mora=True,
++        gl_log_lambda=0.01,
++        gl_log_delta=1e-3,
++    )
++    model = get_peft_model(model, config)
++    gl_layers = [m for m in model.modules() if getattr(m, "use_gl_log_mora", {}).get("default", False)]
++    assert len(gl_layers) == 2, len(gl_layers)
++    assert all(m.lora_Q["default"].requires_grad for m in gl_layers)
++
++    input_ids = torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]])
++    labels = torch.tensor([[1, 2, 3, 4], [2, 1, 0, 3]])
++    output = model(input_ids=input_ids, labels=labels)
++    assert torch.isfinite(output.loss)
++    output.loss.backward()
++    assert all(m.lora_Q["default"].grad is not None for m in gl_layers)
++
++    state = get_peft_model_state_dict(model)
++    q_keys = [key for key in state if "lora_Q" in key]
++    assert len(q_keys) == 2, q_keys
++
++    reloaded = get_peft_model(
++        TinyCausalLM(TinyConfig()),
++        config,
++    )
++    set_peft_model_state_dict(reloaded, state)
++    for original, restored in zip(
++        [m.lora_Q["default"] for m in gl_layers],
++        [m.lora_Q["default"] for m in reloaded.modules() if getattr(m, "use_gl_log_mora", {}).get("default", False)],
++    ):
++        assert torch.allclose(original, restored)
++    print(f"integration passed: {len(gl_layers)} GL layers; {len(q_keys)} Q tensors saved and reloaded")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tests/test_gl_log_mora.py b/tests/test_gl_log_mora.py
+new file mode 100644
+index 0000000..40cc1d3
+--- /dev/null
++++ b/tests/test_gl_log_mora.py
+@@ -0,0 +1,98 @@
++import math
++import sys
++from pathlib import Path
++
++import torch
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "peft-mora" / "src"))
++
++from peft.tuners.lora.layer import Linear
++
++
++def build_layer(in_features=7, out_features=9, mora_type=1):
++    torch.manual_seed(7)
++    base = torch.nn.Linear(in_features, out_features, bias=True)
++    layer = Linear(
++        base,
++        "default",
++        r=2,
++        lora_alpha=2,
++        lora_dropout=0.0,
++        init_lora_weights=True,
++        use_mora=True,
++        mora_type=mora_type,
++        use_gl_log_mora=True,
++        gl_log_lambda=0.01,
++        gl_log_delta=1e-3,
++    )
++    with torch.no_grad():
++        layer.lora_A["default"].weight.normal_(mean=0.0, std=0.2)
++        layer.lora_Q["default"].copy_(torch.eye(layer.r["default"]))
++    return layer
++
++
++def test_identity_initialization_and_regularizer():
++    layer = build_layer()
++    q = layer.lora_Q["default"]
++    assert q.shape == (layer.r["default"], layer.r["default"])
++    assert torch.allclose(q, torch.eye(layer.r["default"]), atol=1e-6)
++    expected = -0.01 * layer.r["default"] * math.log(1.001)
++    actual = layer.gl_log_mora_regularizer("default").item()
++    assert abs(actual - expected) < 1e-6
++
++
++def test_forward_matches_reconstructed_delta():
++    layer = build_layer()
++    x = torch.randn(5, layer.in_features)
++    with torch.no_grad():
++        delta = layer.get_delta_weight("default")
++        explicit = layer._apply_mora(
++            x,
++            layer.lora_A["default"],
++            layer.lora_B["default"],
++            layer.scaling["default"],
++            "default",
++        )
++        reconstructed = torch.nn.functional.linear(x, delta)
++    assert torch.allclose(explicit, reconstructed, atol=2e-5, rtol=2e-5)
++
++
++def test_merge_and_unmerge_round_trip():
++    layer = build_layer()
++    x = torch.randn(3, layer.in_features)
++    with torch.no_grad():
++        before_weight = layer.base_layer.weight.detach().clone()
++        before_bias = layer.base_layer.bias.detach().clone()
++        unmerged_output = layer(x)
++        layer.merge(safe_merge=True)
++        merged_output = layer(x)
++        layer.unmerge()
++        restored_output = layer(x)
++    assert torch.allclose(unmerged_output, merged_output, atol=3e-5, rtol=3e-5)
++    assert torch.allclose(unmerged_output, restored_output, atol=3e-5, rtol=3e-5)
++    assert torch.allclose(layer.base_layer.weight, before_weight, atol=3e-5, rtol=3e-5)
++    assert torch.allclose(layer.base_layer.bias, before_bias, atol=3e-5, rtol=3e-5)
++
++
++def test_q_and_m_receive_gradients():
++    layer = build_layer()
++    x = torch.randn(4, layer.in_features)
++    # M starts at zero in the actual initialization; its task gradient must still flow.
++    with torch.no_grad():
++        layer.lora_A["default"].weight.zero_()
++    output = layer(x)
++    loss = output.square().mean() + layer.gl_log_mora_regularizer("default")
++    loss.backward()
++    assert layer.lora_Q["default"].grad is not None
++    assert layer.lora_A["default"].weight.grad is not None
++    assert torch.isfinite(layer.lora_Q["default"].grad).all()
++    assert torch.isfinite(layer.lora_A["default"].weight.grad).all()
++
++
++if __name__ == "__main__":
++    test_identity_initialization_and_regularizer()
++    test_forward_matches_reconstructed_delta()
++    test_merge_and_unmerge_round_trip()
++    test_q_and_m_receive_gradients()
++    print("GL-log-MoRA unit tests passed")
+diff --git a/tests/test_gl_log_trainer.py b/tests/test_gl_log_trainer.py
+new file mode 100644
+index 0000000..de85ca0
+--- /dev/null
++++ b/tests/test_gl_log_trainer.py
+@@ -0,0 +1,52 @@
++import sys
++from pathlib import Path
++
++import torch
++from transformers import TrainingArguments
++
++ROOT = Path(__file__).resolve().parents[1]
++sys.path.insert(0, str(ROOT / "peft-mora" / "src"))
++sys.path.insert(0, str(ROOT))
++
++from test_gl_log_integration import TinyConfig, TinyCausalLM
++from peft import LoraConfig, get_peft_model
++from train import OurTrainer
++
++
++def main():
++    torch.manual_seed(17)
++    model = get_peft_model(
++        TinyCausalLM(TinyConfig()),
++        LoraConfig(
++            r=2,
++            lora_alpha=2,
++            lora_dropout=0.0,
++            target_modules=["q_proj", "v_proj"],
++            use_mora=True,
++            use_gl_log_mora=True,
++            gl_log_lambda=0.01,
++            gl_log_delta=1e-3,
++        ),
++    )
++    args = TrainingArguments(
++        output_dir=str(ROOT / "tests" / "_trainer_output"),
++        per_device_train_batch_size=1,
++        report_to=[],
++        max_steps=1,
++        learning_rate=2e-4,
++        remove_unused_columns=False,
++    )
++    trainer = OurTrainer(model=model, args=args)
++    trainer.gl_log_q_lr = 3e-4
++    reg = trainer._gl_log_mora_regularization(model)
++    assert reg is not None and torch.isfinite(reg)
++    optimizer = trainer.create_optimizer()
++    q_params = {id(p) for n, p in model.named_parameters() if "lora_Q" in n}
++    q_groups = [group for group in optimizer.param_groups if any(id(p) in q_params for p in group["params"])]
++    assert len(q_groups) == 1
++    assert abs(q_groups[0]["lr"] - 3e-4) < 1e-10
++    print("trainer path passed: regularizer finite and Q lr group is 3e-4")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/train.py b/train.py
+index 5432a18..fffb180 100644
+--- a/train.py
++++ b/train.py
+@@ -116,6 +116,7 @@ class ResetReloraCallback(TrainerCallback):
+ class OurTrainer(Trainer):
+     shuffle_data = True
+     lora_plus_lambda = 1
++    gl_log_q_lr = -1.0
+     use_relora = False
+     use_relora_step = 50
+     use_relora_reset_optimizer = True
+@@ -178,6 +179,21 @@ class OurTrainer(Trainer):
+                     },
+                 ]
+
++            # The paper uses a separate Q learning rate (3e-4 vs 2e-4 for M).
++            # Keep this group separate so the ratio can be reproduced explicitly.
++            q_parameters = [
++                p for n, p in opt_model.named_parameters()
++                if "lora_Q" in n and p.requires_grad
++            ]
++            if q_parameters:
++                q_ids = {id(p) for p in q_parameters}
++                for group in optimizer_grouped_parameters:
++                    group["params"] = [p for p in group["params"] if id(p) not in q_ids]
++                q_lr = self.gl_log_q_lr if self.gl_log_q_lr > 0 else self.args.learning_rate * 1.5
++                optimizer_grouped_parameters.append(
++                    {"params": q_parameters, "weight_decay": 0.0, "lr": q_lr}
++                )
++                logger.info("GL-log-MoRA Q optimizer group: %d parameters, lr=%s", len(q_parameters), q_lr)
+
+             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+
+@@ -236,11 +252,23 @@ class OurTrainer(Trainer):
+         else:
+             return RandomSampler(self.train_dataset)
+
++    def _gl_log_mora_regularization(self, model):
++        """Average the paper's -lambda logdet(Q^T Q + delta I) over active GL layers."""
++        terms = []
++        for module in model.modules():
++            regularizer = getattr(module, "gl_log_mora_regularizer", None)
++            if regularizer is None:
++                continue
++            for adapter_name in getattr(module, "active_adapters", []):
++                if getattr(module, "use_gl_log_mora", {}).get(adapter_name, False):
++                    terms.append(regularizer(adapter_name))
++        if not terms:
++            return None
++        return torch.stack(terms).mean()
++
+     def compute_loss(self, model, inputs, return_outputs=False):
+         """
+-        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+-
+-        Subclass and override for custom behavior.
++        Compute task loss plus the GL-log-MoRA log-determinant regularizer.
+         """
+         if 'labels' not in inputs:
+             inputs['labels'] = inputs['input_ids'].clone()
+@@ -273,10 +301,13 @@ class OurTrainer(Trainer):
+             # We don't use .loss here since the model may return tuples instead of ModelOutput.
+             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
++        gl_regularizer = self._gl_log_mora_regularization(model)
++        if gl_regularizer is not None:
++            loss = loss + gl_regularizer
++
+         # sync loss from all processes
+         self.state.loss = self._nested_gather(loss).mean().item()
+
+-        #  model.base_model.model.model.layers[0].mlp.gate_proj.lora_A['default'].weight
+         return (loss, outputs) if return_outputs else loss
+
+     def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
+@@ -322,7 +353,7 @@ def train(
+         batch_size: int = 128,
+         micro_batch_size: int = 4,
+         num_epochs: int = 1,
+-        learning_rate: float = 3e-4,
++        learning_rate: float = 2e-4,
+         lr_scheduler_type: str = 'linear',
+         cutoff_len: int = 2048,
+         val_set_size: int = 0,
+@@ -373,6 +404,10 @@ def train(
+         # mora
+         use_mora: bool = False,
+         mora_type: int = 1,
++        use_gl_log_mora: bool = False,
++        gl_log_lambda: float = 0.01,
++        gl_log_delta: float = 1e-3,
++        gl_log_q_lr: float = 3e-4,
+         # reslora
+         use_relora: bool = False,
+         use_relora_step: int = 50,
+@@ -533,6 +568,11 @@ def train(
+             kwargs['use_mora'] = True
+             kwargs['mora_type'] = mora_type
+             print('mora type', mora_type)
++        if use_gl_log_mora:
++            kwargs['use_gl_log_mora'] = True
++            kwargs['gl_log_lambda'] = gl_log_lambda
++            kwargs['gl_log_delta'] = gl_log_delta
++            print('GL-log-MoRA', {'lambda': gl_log_lambda, 'delta': gl_log_delta, 'q_lr': gl_log_q_lr})
+
+         if train_embhead:
+             kwargs['modules_to_save'] = ['embed_tokens', 'lm_head', 'norm', 'input_layernorm', 'post_attention_layernorm' ]
+@@ -678,6 +718,7 @@ def train(
+         data_collator=data_collator,
+     )
+     trainer.lora_plus_lambda = lora_plus_lambda
++    trainer.gl_log_q_lr = gl_log_q_lr
+     trainer.use_relora = use_relora
+     trainer.use_relora_step = use_relora_step
+     trainer.use_relora_reset_optimizer = not use_relora_not_reset_optimizer
